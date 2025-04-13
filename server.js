@@ -191,6 +191,160 @@ const makeUnsignedRequest = async (endpoint, method, params = {}) => {
   }
 };
 
+// ATR calculation for risk management
+const calculateATR = async (symbol = 'BTCUSDT', interval = '15m', period = 14) => {
+  try {
+    // Get historical klines data
+    const klines = await makeUnsignedRequest('/fapi/v1/klines', 'GET', {
+      symbol, 
+      interval, 
+      limit: period + 10 // Get a few extra candles for calculation
+    });
+
+    if (!Array.isArray(klines) || klines.length < period) {
+      console.error('Insufficient klines data for ATR calculation');
+      return null;
+    }
+
+    const trueRanges = [];
+    
+    // Calculate true ranges
+    for (let i = 1; i < klines.length; i++) {
+      const high = parseFloat(klines[i][2]);
+      const low = parseFloat(klines[i][3]);
+      const prevClose = parseFloat(klines[i-1][4]);
+      
+      // True Range = max(high - low, abs(high - prevClose), abs(low - prevClose))
+      const tr1 = high - low;
+      const tr2 = Math.abs(high - prevClose);
+      const tr3 = Math.abs(low - prevClose);
+      const tr = Math.max(tr1, tr2, tr3);
+      
+      trueRanges.push(tr);
+    }
+    
+    // Calculate the ATR (simple average of the true ranges over the period)
+    const atr = trueRanges.slice(-period).reduce((sum, tr) => sum + tr, 0) / period;
+    
+    console.log(`Calculated ATR for ${symbol} on ${interval} timeframe: ${atr}`);
+    return atr;
+    
+  } catch (error) {
+    console.error('Failed to calculate ATR:', error);
+    return null;
+  }
+};
+
+// Calculate dynamic stop loss and take profit based on ATR
+const calculateDynamicSLTP = async (side, entryPrice, atrMultiplier = 1.5, riskRewardRatio = 2) => {
+  try {
+    const atr = await calculateATR('BTCUSDT', '15m');
+    
+    if (!atr) {
+      console.warn('Failed to get ATR, using fallback percentage-based SL/TP calculation');
+      // Fallback to percentage-based calculation (2% risk)
+      const riskPercentage = 0.02;
+      
+      if (side.toUpperCase() === 'BUY') {
+        return {
+          stopLossPrice: entryPrice * (1 - riskPercentage),
+          takeProfitPrice: entryPrice * (1 + riskPercentage * riskRewardRatio)
+        };
+      } else {
+        return {
+          stopLossPrice: entryPrice * (1 + riskPercentage),
+          takeProfitPrice: entryPrice * (1 - riskPercentage * riskRewardRatio)
+        };
+      }
+    }
+    
+    // Calculate SL/TP based on ATR
+    if (side.toUpperCase() === 'BUY') {
+      const stopLossPrice = entryPrice - (atr * atrMultiplier);
+      const takeProfitPrice = entryPrice + (atr * atrMultiplier * riskRewardRatio);
+      
+      return {
+        stopLossPrice,
+        takeProfitPrice
+      };
+    } else {
+      const stopLossPrice = entryPrice + (atr * atrMultiplier);
+      const takeProfitPrice = entryPrice - (atr * atrMultiplier * riskRewardRatio);
+      
+      return {
+        stopLossPrice,
+        takeProfitPrice
+      };
+    }
+  } catch (error) {
+    console.error('Error calculating dynamic SL/TP:', error);
+    return null;
+  }
+};
+
+// Place stop loss and take profit orders
+const placeStopLossTakeProfitOrders = async (
+  mainOrderId, 
+  symbol, 
+  closeSide, 
+  quantity, 
+  stopLossPrice, 
+  takeProfitPrice
+) => {
+  const orders = [];
+  const timestamp = getAdjustedTimestamp();
+  
+  console.log(`Placing SL/TP for order ${mainOrderId}: SL=${stopLossPrice}, TP=${takeProfitPrice}`);
+  
+  // Format prices to match symbol precision
+  const stopLossPriceStr = stopLossPrice.toFixed(2);
+  const takeProfitPriceStr = takeProfitPrice.toFixed(2);
+  
+  // Place Stop Loss Order
+  try {
+    const slParams = {
+      symbol: symbol.toUpperCase(),
+      side: closeSide,
+      type: 'STOP_MARKET',
+      quantity: quantity.toString(),
+      stopPrice: stopLossPriceStr,
+      closePosition: 'true',
+      workingType: 'MARK_PRICE',
+      timeInForce: 'GTC',
+    };
+    
+    const slResponse = await makeSignedRequest('/fapi/v1/order', 'POST', slParams);
+    console.log('Stop loss order placed:', slResponse);
+    orders.push({ type: 'stopLoss', order: slResponse });
+  } catch (slError) {
+    console.error('Failed to place stop loss order:', slError);
+    orders.push({ type: 'stopLoss', error: slError.message });
+  }
+  
+  // Place Take Profit Order
+  try {
+    const tpParams = {
+      symbol: symbol.toUpperCase(),
+      side: closeSide,
+      type: 'TAKE_PROFIT_MARKET',
+      quantity: quantity.toString(),
+      stopPrice: takeProfitPriceStr,
+      closePosition: 'true',
+      workingType: 'MARK_PRICE',
+      timeInForce: 'GTC',
+    };
+    
+    const tpResponse = await makeSignedRequest('/fapi/v1/order', 'POST', tpParams);
+    console.log('Take profit order placed:', tpResponse);
+    orders.push({ type: 'takeProfit', order: tpResponse });
+  } catch (tpError) {
+    console.error('Failed to place take profit order:', tpError);
+    orders.push({ type: 'takeProfit', error: tpError.message });
+  }
+  
+  return orders;
+};
+
 // Endpoint: Get BTCUSDT price
 app.get('/api/price', async (req, res) => {
   try {
@@ -211,11 +365,34 @@ app.get('/api/account', async (req, res) => {
   }
 });
 
-// Endpoint: Place market order
+
+app.get('/api/atr', async (req, res) => {
+    try {
+      const { symbol = 'BTCUSDT', interval = '15m', period = 14 } = req.query;
+      const atr = await calculateATR(symbol, interval, parseInt(period));
+      
+      if (atr === null) {
+        return res.status(500).json({ error: 'Failed to calculate ATR' });
+      }
+      
+      res.json({ 
+        symbol, 
+        interval, 
+        period: parseInt(period), 
+        atr,
+        timestamp: Date.now()
+      });
+    } catch (error) {
+      res.status(500).json({ error: 'Failed to calculate ATR', details: error.message });
+    }
+  });
+
+  
+// Endpoint: Place market order with SL/TP
 app.post('/api/order', async (req, res) => {
   console.log('Received order request:', req.body);
 
-  const { side, quantity, symbol = 'BTCUSDT', type = 'MARKET', price } = req.body;
+  const { side, quantity, symbol = 'BTCUSDT', type = 'MARKET', price, placeSLTP = true } = req.body;
 
   if (!side || !quantity) {
     return res.status(400).json({ error: 'Side and quantity are required' });
@@ -281,6 +458,38 @@ app.post('/api/order', async (req, res) => {
     console.log('Sending to Binance with params:', orderParams);
 
     const orderResponse = await makeSignedRequest('/fapi/v1/order', 'POST', orderParams);
+    
+    // If stop loss and take profit are requested
+    if (placeSLTP && orderResponse && orderResponse.status === 'FILLED') {
+      try {
+        // Calculate SL/TP values using ATR
+        const sltp = await calculateDynamicSLTP(
+          side, 
+          parseFloat(orderResponse.avgPrice || orderResponse.price)
+        );
+        
+        if (sltp) {
+          console.log('Calculated SL/TP values:', sltp);
+          
+          // Place SL/TP orders
+          await placeStopLossTakeProfitOrders(
+            orderResponse.orderId,
+            symbol,
+            side === 'BUY' ? 'SELL' : 'BUY',
+            roundedQuantity,
+            sltp.stopLossPrice,
+            sltp.takeProfitPrice
+          );
+          
+          orderResponse.stopLossPrice = sltp.stopLossPrice;
+          orderResponse.takeProfitPrice = sltp.takeProfitPrice;
+        }
+      } catch (sltpError) {
+        console.error('Failed to place SL/TP orders:', sltpError);
+        res.status(500).json({ error: 'Failed to place SL/TP orders', details: sltpError.message });
+      }
+    }
+    
     res.json(orderResponse);
   } catch (error) {
     console.error('Binance API error:', error.response ? error.response.data : error.message);

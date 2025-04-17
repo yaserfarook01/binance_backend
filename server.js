@@ -392,7 +392,7 @@ app.get('/api/account', async (req, res) => {
 // Get klines endpoint
 app.get('/api/klines', async (req, res) => {
   try {
-    const { symbol = 'BTCUSDT', interval = '1h', limit = 100 } = req.query;
+    const { symbol = 'BTCUSDT', interval = '1h', limit = 1000 } = req.query;
     const klines = await axiosInstance.get('/fapi/v1/klines', {
       params: { symbol, interval, limit }
     });

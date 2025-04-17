@@ -390,15 +390,29 @@ app.get('/api/account', async (req, res) => {
 });
 
 // Get klines endpoint
+// In the /api/klines endpoint
 app.get('/api/klines', async (req, res) => {
   try {
-    const { symbol = 'BTCUSDT', interval = '1h', limit = 1000 } = req.query;
-    const klines = await axiosInstance.get('/fapi/v1/klines', {
-      params: { symbol, interval, limit }
-    });
+    const { symbol = 'BTCUSDT', interval = '1h', limit = 1000, startTime, endTime } = req.query;
+    const params = { symbol, interval, limit };
+    if (startTime) params.startTime = startTime;
+    if (endTime) params.endTime = endTime;
+
+    const klines = await axiosInstance.get('/fapi/v1/klines', { params });
+    
+    if (!klines.data || klines.data.length === 0) {
+      return res.status(404).json({ error: 'No klines data available for the requested period' });
+    }
+
+    // Warn if fewer candles than requested
+    if (klines.data.length < limit) {
+      console.warn(`Requested ${limit} candles but received ${klines.data.length}`);
+    }
+
     res.json(klines.data);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch klines' });
+    console.error('Klines fetch error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch klines', message: error.message });
   }
 });
 
